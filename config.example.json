@@ -1,0 +1,20 @@
+{
+  "imap_host": "imap.example.com",
+  "imap_port": 993,
+  "imap_ssl": true,
+  "imap_user": "your_email@example.com",
+  "imap_pass": "your_app_password",
+  "imap_folder": "INBOX",
+  "headless": true,
+  "captcha_timeout_sec": 120,
+  "email_poll_timeout_sec": 90,
+  "default_password": "",
+  "auto_verify_email": true,
+  "concurrency": 2,
+  "proxy_enabled": false,
+  "proxy_strategy": "round_robin",
+  "proxy_pool": "",
+  "proxy_server": "",
+  "proxy_username": "",
+  "proxy_password": ""
+}

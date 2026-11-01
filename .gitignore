@@ -1,0 +1,26 @@
+# Environment & Virtualenvs
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# User Data & Private Credentials (CRITICAL)
+config.json
+tasks.json
+accounts_with_tokens.json
+tokens.txt
+*.log
+
+# Temporary Debug Files & Screenshots
+*.png
+*.jpg
+*.jpeg
+test_*.py
+inspect_*.py
+
+# System & IDE
+.DS_Store
+.idea/
+.vscode/

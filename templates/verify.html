@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Z.ai 人机滑块排队验证台 - 一站式流水线</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- FontAwesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    @keyframes pulse-ring {
+      0% { transform: scale(0.95); opacity: 0.8; }
+      50% { transform: scale(1.05); opacity: 1; }
+      100% { transform: scale(0.95); opacity: 0.8; }
+    }
+    .pulse-glow {
+      animation: pulse-ring 2s infinite ease-in-out;
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans select-none overflow-x-hidden">
+
+  <!-- Top Navbar -->
+  <header class="bg-slate-900/90 border-b border-slate-800 px-6 py-3.5 flex items-center justify-between sticky top-0 z-50 backdrop-blur-md">
+    <div class="flex items-center gap-3">
+      <a href="/" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-medium transition">
+        <i class="fa-solid fa-arrow-left"></i>
+        <span>返回主控制台</span>
+      </a>
+      <div class="h-4 w-px bg-slate-700"></div>
+      <div class="flex items-center gap-2">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-indigo-500 to-violet-500 flex items-center justify-center text-white shadow-lg shadow-indigo-500/30">
+          <i class="fa-solid fa-puzzle-piece text-sm"></i>
+        </div>
+        <div>
+          <h1 class="text-sm font-bold text-white flex items-center gap-2">
+            <span>人机滑块排队验证台</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-normal">单路独占队列</span>
+          </h1>
+          <p class="text-[11px] text-slate-400">自动防冲突排队：做完一个，下一个无缝接着来</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Active Task Status & Queue Info -->
+    <div class="flex items-center gap-4">
+      <div id="activeTaskBanner" class="hidden flex items-center gap-2 px-3 py-1.5 rounded-lg bg-indigo-950/80 border border-indigo-500/40 text-xs">
+        <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping"></span>
+        <span class="text-slate-400">正在验证:</span>
+        <span id="activeEmailText" class="font-mono font-semibold text-white">--</span>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <div id="queueCountBadge" class="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 text-xs font-medium flex items-center gap-1.5 border border-slate-700">
+          <i class="fa-solid fa-layer-group text-indigo-400"></i>
+          <span>排队等待: <strong id="queueCountText" class="text-amber-400 font-bold">0</strong> 个</span>
+        </div>
+
+        <button onclick="toggleAudio()" id="audioToggleBtn" class="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition" title="开启/关闭提示音">
+          <i class="fa-solid fa-volume-high"></i>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Canvas Container -->
+  <main class="flex-1 flex flex-col items-center justify-center p-4 relative">
+    
+    <!-- Canvas Frame Box (1280x800 aspect ratio) -->
+    <div class="relative w-full max-w-5xl aspect-[16/10] bg-slate-900 rounded-2xl overflow-hidden border border-slate-800 shadow-2xl flex items-center justify-center">
+      
+      <!-- Interactive Remote Canvas -->
+      <canvas id="remoteCanvas" width="1280" height="800" class="w-full h-full object-contain cursor-grab active:cursor-grabbing block"></canvas>
+
+      <!-- Idle / Waiting Overlay (When queue is empty) -->
+      <div id="idleOverlay" class="absolute inset-0 bg-slate-950/90 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center z-10 transition-all duration-300">
+        <div class="w-20 h-20 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 text-3xl mb-4 pulse-glow">
+          <i class="fa-solid fa-mug-hot"></i>
+        </div>
+        <h2 class="text-lg font-bold text-white mb-1.5">当前没有待滑动的验证码</h2>
+        <p class="text-xs text-slate-400 max-w-md mb-6 leading-relaxed">
+          批量注册流水线正在后台全自动静默运行中。一旦有新账号需要人工拼图，系统会自动将画面投屏至此处并发出提示音，<strong class="text-indigo-300">无需刷新页面</strong>。
+        </p>
+        <div class="flex items-center gap-3">
+          <a href="/" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-600/30 transition flex items-center gap-1.5">
+            <i class="fa-solid fa-list-check"></i>
+            <span>查看任务列表进度</span>
+          </a>
+        </div>
+      </div>
+
+      <!-- Loading Spinner for Transition between tasks -->
+      <div id="transitionSpinner" class="hidden absolute inset-0 bg-slate-950/70 backdrop-blur-xs flex flex-col items-center justify-center text-center z-20">
+        <div class="w-12 h-12 border-3 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3"></div>
+        <p class="text-xs font-medium text-slate-200">正在接入下一个账号画面...</p>
+      </div>
+
+    </div>
+
+    <!-- Instruction Bar -->
+    <div class="w-full max-w-5xl mt-3 px-4 py-2.5 rounded-xl bg-slate-900/60 border border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
+      <div class="flex items-center gap-2">
+        <i class="fa-solid fa-circle-info text-indigo-400"></i>
+        <span>使用鼠标直接在上方画面中拖拽拼图滑块。验证成功后系统将自动放行并立刻接入下一位排队账号。</span>
+      </div>
+      <div class="flex items-center gap-2 font-mono text-[11px] text-slate-500">
+        <span id="fpsIndicator">60 FPS</span>
+        <span>•</span>
+        <span id="latencyIndicator">WS 连接正常</span>
+      </div>
+    </div>
+
+  </main>
+
+  <script>
+    let ws = null;
+    let activeCaptchaTaskId = null;
+    let isCanvasMouseDown = false;
+    let audioEnabled = true;
+
+    function playChime() {
+      if (!audioEnabled) return;
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(587.33, audioCtx.currentTime); // D5
+        osc.frequency.exponentialRampToValueAtTime(880, audioCtx.currentTime + 0.15); // A5
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.35);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.35);
+      } catch (e) {}
+    }
+
+    function toggleAudio() {
+      audioEnabled = !audioEnabled;
+      const btn = document.getElementById("audioToggleBtn");
+      btn.innerHTML = audioEnabled ? '<i class="fa-solid fa-volume-high"></i>' : '<i class="fa-solid fa-volume-xmark text-rose-400"></i>';
+    }
+
+    function connectWS() {
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+
+      ws.onopen = () => {
+        document.getElementById("latencyIndicator").innerText = "已连接 WebSocket";
+        document.getElementById("latencyIndicator").className = "text-emerald-400";
+      };
+
+      ws.onclose = () => {
+        document.getElementById("latencyIndicator").innerText = "正在重连 WebSocket...";
+        document.getElementById("latencyIndicator").className = "text-rose-400";
+        setTimeout(connectWS, 2000);
+      };
+
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          handleMessage(msg);
+        } catch (err) {}
+      };
+    }
+
+    function handleMessage(msg) {
+      switch (msg.type) {
+        case "INIT":
+        case "TASKS_ADDED":
+        case "TASK_UPDATED":
+          updateQueueStats();
+          break;
+        case "CAPTCHA_START":
+          activeCaptchaTaskId = msg.data.task_id;
+          document.getElementById("activeEmailText").innerText = msg.data.email || msg.data.task_id;
+          document.getElementById("activeTaskBanner").classList.remove("hidden");
+          document.getElementById("idleOverlay").classList.add("hidden");
+          document.getElementById("transitionSpinner").classList.remove("hidden");
+          playChime();
+          updateQueueStats();
+          break;
+        case "CAPTCHA_FRAME":
+          activeCaptchaTaskId = msg.data.task_id;
+          if (msg.data.email) {
+            document.getElementById("activeEmailText").innerText = msg.data.email;
+          }
+          document.getElementById("activeTaskBanner").classList.remove("hidden");
+          document.getElementById("idleOverlay").classList.add("hidden");
+          document.getElementById("transitionSpinner").classList.add("hidden");
+          renderFrame(msg.data.image);
+          break;
+        case "CAPTCHA_STOP":
+          if (msg.data.task_id === activeCaptchaTaskId) {
+            activeCaptchaTaskId = null;
+            document.getElementById("activeTaskBanner").classList.add("hidden");
+            document.getElementById("idleOverlay").classList.remove("hidden");
+            document.getElementById("transitionSpinner").classList.add("hidden");
+            updateQueueStats();
+          }
+          break;
+      }
+    }
+
+    async function updateQueueStats() {
+      try {
+        const res = await fetch("/api/tasks").then(r => r.json());
+        const queued = res.filter(t => t.status === "WAITING_CAPTCHA" || t.status === "QUEUED_CAPTCHA");
+        const count = Math.max(0, queued.length - (activeCaptchaTaskId ? 1 : 0));
+        document.getElementById("queueCountText").innerText = count;
+      } catch (e) {}
+    }
+
+    function renderFrame(base64Data) {
+      if (!base64Data) return;
+      const canvas = document.getElementById("remoteCanvas");
+      const ctx = canvas.getContext("2d");
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        document.getElementById("idleOverlay").classList.add("hidden");
+        document.getElementById("transitionSpinner").classList.add("hidden");
+      };
+      img.src = "data:image/jpeg;base64," + base64Data;
+    }
+
+    function initRemoteMouse() {
+      const canvas = document.getElementById("remoteCanvas");
+
+      function sendEvent(eventType, e) {
+        if (!ws || ws.readyState !== WebSocket.OPEN || !activeCaptchaTaskId) return;
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = 1280 / rect.width;
+        const scaleY = 800 / rect.height;
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        const x = Math.round((clientX - rect.left) * scaleX);
+        const y = Math.round((clientY - rect.top) * scaleY);
+
+        ws.send(JSON.stringify({
+          type: "REMOTE_MOUSE",
+          task_id: activeCaptchaTaskId,
+          event: eventType,
+          x: x,
+          y: y,
+          button: "left",
+          is_down: isCanvasMouseDown
+        }));
+      }
+
+      canvas.addEventListener("mousedown", (e) => {
+        isCanvasMouseDown = true;
+        sendEvent("mousePressed", e);
+      });
+      window.addEventListener("mousemove", (e) => {
+        if (isCanvasMouseDown) sendEvent("mouseMoved", e);
+      });
+      window.addEventListener("mouseup", (e) => {
+        if (isCanvasMouseDown) {
+          isCanvasMouseDown = false;
+          sendEvent("mouseReleased", e);
+        }
+      });
+
+      // Touch events for tablets / laptops
+      canvas.addEventListener("touchstart", (e) => {
+        isCanvasMouseDown = true;
+        sendEvent("mousePressed", e);
+      }, { passive: true });
+      window.addEventListener("touchmove", (e) => {
+        if (isCanvasMouseDown) sendEvent("mouseMoved", e);
+      }, { passive: true });
+      window.addEventListener("touchend", (e) => {
+        if (isCanvasMouseDown) {
+          isCanvasMouseDown = false;
+          sendEvent("mouseReleased", e);
+        }
+      });
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      connectWS();
+      initRemoteMouse();
+      updateQueueStats();
+    });
+  </script>
+</body>
+</html>
