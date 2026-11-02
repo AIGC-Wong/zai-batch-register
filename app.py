@@ -14,7 +14,14 @@ from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 from pydantic import BaseModel
 
-from config_manager import load_config, save_config, load_tasks, save_tasks
+from config_manager import (
+    load_config,
+    save_config,
+    load_tasks,
+    save_tasks,
+    write_text_atomic,
+    write_json_atomic,
+)
 from email_service import EmailService
 from register_worker import RegisterWorker
 
@@ -30,22 +37,90 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 config = load_config()
 tasks: List[Dict[str, Any]] = load_tasks()
 
+# 这些状态代表"任务正在流水线里"，启动重置时绝不能把它们打回 PENDING
+ACTIVE_STATUSES = {"RUNNING", "QUEUED", "QUEUED_CAPTCHA", "WAITING_CAPTCHA", "WAITING_EMAIL", "VERIFYING"}
+
 # Automatically recover any tasks left in RUNNING/VERIFYING/QUEUED state from a previous restart
+_recovered = False
 for t in tasks:
-    if t.get("status") in ["RUNNING", "VERIFYING", "WAITING_CAPTCHA", "QUEUED_CAPTCHA", "QUEUED"]:
+    if t.get("status") in ACTIVE_STATUSES:
         t["status"] = "PENDING"
         t["message"] = "未完成，已自动重置为待执行"
-save_tasks(tasks)
-save_tasks(tasks)
+        _recovered = True
+if _recovered:
+    # 只在确实改动时落盘。旧实现无条件连写两次，
+    # 而当时 load_tasks() 解析失败会返回 []，等于启动即清空全部任务。
+    save_tasks(tasks)
 
 active_websockets: List[WebSocket] = []
 active_cdp_sessions: Dict[str, Any] = {}
 is_running_batch = False
 stop_requested = False
-save_lock = asyncio.Lock()
+# 只用于串行化"领取 PENDING 任务"这一临界区。落盘本身已由 config_manager
+# 的原子写 + 进程内锁保证，不需要再靠这个锁来保护文件。
+claim_lock = asyncio.Lock()
 captcha_lock = asyncio.Lock()
 latest_captcha_frames: Dict[str, str] = {}
 batch_queue_task: Optional[asyncio.Task] = None
+
+def _config_playwright_proxy(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """从全局配置拼出 Playwright 的 proxy 字典，供旁路流程（取票等）复用。"""
+    if not (cfg.get("proxy_enabled") and cfg.get("proxy_server")):
+        return None
+    proxy_cfg: Dict[str, Any] = {"server": cfg["proxy_server"].strip()}
+    if cfg.get("proxy_username"):
+        proxy_cfg["username"] = cfg["proxy_username"].strip()
+    if cfg.get("proxy_password"):
+        proxy_cfg["password"] = cfg["proxy_password"]
+    return proxy_cfg
+
+def _decode_jwt_payload(token: str) -> Dict[str, Any]:
+    """解出 JWT payload，失败返回空 dict。"""
+    try:
+        import base64
+        import json
+        seg = token.split(".")[1]
+        seg += "=" * ((4 - len(seg) % 4) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg))
+    except Exception:
+        return {}
+
+def archive_credentials():
+    """
+    把成功任务的凭据归档到 tokens.txt 与 accounts_with_tokens.json。
+    README 一直宣称会自动归档，但旧代码里根本没有写盘逻辑，只有一个下载接口。
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    tokens: List[str] = []
+    accounts: List[Dict[str, Any]] = []
+
+    for t in load_tasks():
+        jwt = t.get("cli_jwt") or t.get("jwt") or ""
+        if t.get("status") != "SUCCESS" or not jwt or "." not in jwt:
+            continue
+        # 严格过滤游客 guest token
+        if "guest-" in str(_decode_jwt_payload(jwt).get("email", "")):
+            continue
+        if jwt not in tokens:
+            tokens.append(jwt)
+        accounts.append({
+            "email": t.get("email", ""),
+            "name": t.get("name", ""),
+            "password": t.get("password", ""),
+            "token": jwt,
+            "cli_jwt": t.get("cli_jwt", ""),
+            "web_jwt": t.get("web_jwt", ""),
+            "device_mid": t.get("device_mid", ""),
+            "sub": t.get("sub", ""),
+            "access_token": t.get("access_token", ""),
+            "completed_at": t.get("completed_at", ""),
+        })
+
+    try:
+        write_text_atomic(os.path.join(base, "tokens.txt"), "\n".join(tokens))
+        write_json_atomic(os.path.join(base, "accounts_with_tokens.json"), accounts)
+    except Exception as exc:
+        print(f"[archive_credentials] 归档失败: {exc}")
 
 def get_email_service() -> EmailService:
     cfg = load_config()
@@ -94,6 +169,9 @@ def sync_log_callback(task_id: str, message: str, level: str):
 
 def on_task_status_change(task: Dict[str, Any]):
     save_tasks(tasks)
+    if task.get("status") == "SUCCESS":
+        # README 承诺自动归档 tokens.txt / accounts_with_tokens.json，旧实现从未落盘
+        archive_credentials()
     asyncio.create_task(broadcast("TASK_UPDATED", task))
 
 def generate_random_password(length: int = 14) -> str:
@@ -108,10 +186,12 @@ def generate_random_password(length: int = 14) -> str:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global tasks
     await websocket.accept()
     active_websockets.append(websocket)
-    tasks = load_tasks()
+    # 这里绝对不能 tasks = load_tasks()。
+    # /verify 与主控台都连这个端点，而 README 要求批处理期间另开 /verify；
+    # 一旦把全局 tasks 换成一份磁盘快照，正在执行的任务 dict 就与内存脱钩，
+    # worker 之后所有状态更新都写不进 tasks，UI 会永远卡在"排队中"。
     await websocket.send_json({"type": "INIT", "tasks": tasks, "config": load_config()})
     
     # 若有正在等待滑块验证的任务，立即将状态及最新画面帧同步给新连入的网页（如刷新或新打开的 /verify）
@@ -283,8 +363,8 @@ async def test_email_api(data: Dict[str, Any] = Body(...)):
 
 @app.get("/api/tasks")
 async def get_tasks_api():
-    global tasks
-    tasks = load_tasks()
+    # 不要重新读盘并整体替换全局列表：worker 持有的是列表里 dict 的引用，
+    # 换掉列表会让正在执行的任务与内存状态脱钩，后续状态更新全部丢失。
     return tasks
 
 class BatchAddRequest(BaseModel):
@@ -346,7 +426,9 @@ async def add_tasks_api(req: BatchAddRequest):
         existing_emails.add(email.lower())
             
         if not pwd:
-            pwd = "Password123!@#"
+            # README 承诺"自动生成高强度随机密码"，旧实现却写死了同一个弱口令，
+            # 导致所有未指定密码的账号共用 Password123!@#
+            pwd = generate_random_password()
             
         task_id = f"task_{secrets.token_hex(4)}"
         task = {
@@ -365,14 +447,18 @@ async def add_tasks_api(req: BatchAddRequest):
     await broadcast("TASKS_ADDED", added)
 
     # 若勾选了自动启动
-    global is_running_batch, stop_requested
-    if req.auto_start and not is_running_batch:
+    global is_running_batch, stop_requested, batch_queue_task
+    auto_started = False
+    if req.auto_start and not (is_running_batch and batch_queue_task and not batch_queue_task.done()):
         stop_requested = False
         cfg = load_config()
         concurrency = int(cfg.get("concurrency") or 2)
-        asyncio.create_task(run_batch_queue(concurrency))
+        # 必须登记任务句柄：旧实现丢弃了返回值，batch_queue_task 永远是 None，
+        # 于是 start_batch_api 的"已在运行"守卫失效，能再起第二条流水线。
+        batch_queue_task = asyncio.create_task(run_batch_queue(concurrency))
+        auto_started = True
 
-    return {"success": True, "count": len(added), "auto_started": bool(req.auto_start)}
+    return {"success": True, "count": len(added), "auto_started": auto_started}
 
 @app.post("/api/tasks/clear")
 async def clear_tasks_api(clear_type: str = Body(default="all")):
@@ -395,6 +481,11 @@ async def delete_task_api(task_id: str):
 
 async def run_batch_queue(concurrency: int = 2):
     global is_running_batch, stop_requested
+    if is_running_batch:
+        # 已有流水线在跑。auto_start 与手动启动不能各起一条，
+        # 否则谁先结束谁就把 is_running_batch 置 False，UI 提前显示"已停止"。
+        sync_log_callback("SYSTEM", "流水线已在运行，忽略重复启动请求", "warning")
+        return
     is_running_batch = True
     stop_requested = False
     
@@ -408,7 +499,7 @@ async def run_batch_queue(concurrency: int = 2):
     async def worker_loop(worker_idx: int):
         while not stop_requested:
             task_to_run = None
-            async with save_lock:
+            async with claim_lock:
                 for t in tasks:
                     if t["status"] in ["PENDING"]:
                         t["status"] = "QUEUED"
@@ -452,20 +543,33 @@ async def start_batch_api(data: Dict[str, Any] = Body(default={})):
         cfg["concurrency"] = concurrency
         save_config(cfg)
 
-    # 将未成功完成的所有任务（失败、排队、中断）全部重置为 PENDING 待办
+    # 关键顺序：先判断"是否已在运行"，再决定要不要重置任务。
+    # 旧实现无条件把所有非 SUCCESS 任务（含 RUNNING / WAITING_CAPTCHA）打回 PENDING，
+    # 批处理中途再点一次启动，正在跑的账号会被重新领走，造成同一邮箱重复注册。
+    already_running = bool(is_running_batch and batch_queue_task and not batch_queue_task.done())
+
+    # 只重置"可以安全重跑"的任务：
+    #  - ACTIVE_STATUSES 里的任务正在流水线中，重置会让同一账号被并发跑两遍
+    #  - WAITING_MANUAL_TOKEN 是等用户手动补录，重跑只会撞"邮箱已存在"并把它判失败
+    # FAILED / 中断的任务仍然会被放回待办，保留"再点一次启动就重试失败账号"的原始语义。
+    reset_changed = False
     for t in tasks:
-        if t["status"] != "SUCCESS":
+        status = t.get("status")
+        if status in ACTIVE_STATUSES or status in ("SUCCESS", "WAITING_MANUAL_TOKEN"):
+            continue
+        if status != "PENDING":
             t["status"] = "PENDING"
             t["message"] = "等待执行"
-    save_tasks(tasks)
-    await broadcast("TASKS_LOADED", tasks)
+            reset_changed = True
+    if reset_changed:
+        save_tasks(tasks)
+        await broadcast("TASKS_LOADED", tasks)
 
     stop_requested = False
-    
-    # 若已经在运行，直接返回成功，后台 worker 会自动拉取刚重置的 PENDING 任务
-    if is_running_batch and batch_queue_task and not batch_queue_task.done():
-        sync_log_callback("SYSTEM", f"流水线运行中，已注入待办任务并刷新并发设置 ({concurrency} 路)", "info")
-        return {"success": True, "message": "流水线运行中，已注入待办任务", "concurrency": concurrency}
+
+    if already_running:
+        sync_log_callback("SYSTEM", f"流水线运行中，已刷新并发设置 ({concurrency} 路)，新增待办会自动接入", "info")
+        return {"success": True, "message": "流水线运行中，新增任务将自动接入", "concurrency": concurrency}
 
     batch_queue_task = asyncio.create_task(run_batch_queue(concurrency))
     return {"success": True, "concurrency": concurrency}
@@ -478,20 +582,25 @@ async def pause_batch_api():
 
 @app.post("/api/tasks/{task_id}/retry")
 async def retry_task_api(task_id: str):
+    global batch_queue_task
     target = next((t for t in tasks if t["id"] == task_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Task not found")
-        
+
     target["status"] = "PENDING"
     target["message"] = "准备重试"
     save_tasks(tasks)
     await broadcast("TASK_UPDATED", target)
-    
+
+    # 旧实现直接 create_task(worker.execute_task(...))，绕过了调度器：
+    # 批处理在跑时 worker_loop 会把这个 PENDING 再领一次，同一账号被并发注册两次。
+    # 现在统一交回流水线处理。
+    if is_running_batch and batch_queue_task and not batch_queue_task.done():
+        return {"success": True, "message": "流水线运行中，该任务已重新入队"}
+
     cfg = load_config()
-    email_svc = get_email_service()
-    worker = RegisterWorker(cfg, email_svc, log_callback=sync_log_callback, cdp_callback=cdp_callback, captcha_lock=captcha_lock)
-    
-    asyncio.create_task(worker.execute_task(target, on_status_change=on_task_status_change))
+    concurrency = int(cfg.get("concurrency") or 2)
+    batch_queue_task = asyncio.create_task(run_batch_queue(concurrency))
     return {"success": True}
 
 @app.post("/api/tasks/{task_id}/manual-verify")
@@ -616,44 +725,58 @@ async def oauth_cli_start_api(task_id: str):
     target = next((t for t in tasks if t["id"] == task_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Task not found")
-        
+
+    from zcode_token import _request_json as zcode_request_json
+    from proxy_manager import playwright_cfg_to_requests_proxy
+
     poll_token = secrets.token_hex(32)
-    import requests
-    res = requests.post(
-        "https://zcode.z.ai/api/v1/oauth/cli/init",
-        headers={"Authorization": f"Bearer {poll_token}"},
-        json={"provider": "zai"},
-        timeout=10
-    ).json()
-    
+    auth_headers = {"Authorization": f"Bearer {poll_token}"}
+
+    # 浏览器走代理时，这里的取票请求也必须走同一出口，否则会从真实 IP 打官方接口
+    req_proxy = playwright_cfg_to_requests_proxy(_config_playwright_proxy(load_config()))
+
+    try:
+        res = await zcode_request_json(
+            "POST",
+            "https://zcode.z.ai/api/v1/oauth/cli/init",
+            {"Content-Type": "application/json", **auth_headers},
+            json_body={"provider": "zai"},
+            proxies=req_proxy,
+        )
+    except Exception as exc:
+        return {"success": False, "message": f"向官方发起 OAuth 流程失败: {exc}"}
+
     if res.get("code") != 0 or "data" not in res:
         return {"success": False, "message": "向官方发起 OAuth 流程失败"}
-        
+
     flow_id = res["data"]["flow_id"]
     authorize_url = res["data"]["authorize_url"]
-    
+
     sync_log_callback(task_id, f"已生成官方 OAuth CLI 授权会话，正在等待授权: {target['email']}", "info")
-    
+
     async def poll_flow():
         start_t = time.time()
         while time.time() - start_t < 300:
             await asyncio.sleep(2)
             try:
-                p_res = requests.get(
+                # 走 _request_json（内部 to_thread），旧实现在协程里直接 requests.get，
+                # 每次轮询都会把整个事件循环阻塞最长 10 秒，推流和其它 worker 全部停摆。
+                p_res = await zcode_request_json(
+                    "GET",
                     f"https://zcode.z.ai/api/v1/oauth/cli/poll/{flow_id}",
-                    headers={"Authorization": f"Bearer {poll_token}"},
-                    timeout=10
-                ).json()
+                    auth_headers,
+                    proxies=req_proxy,
+                )
                 p_data = p_res.get("data", {})
                 if p_data.get("status") == "ready" and p_data.get("token"):
                     cli_jwt = p_data["token"]
                     user_info = p_data.get("user", {})
                     access_token = p_data.get("zai", {}).get("access_token", "")
-                    
+
                     from zcode_token import parse_jwt_sub, generate_device_mid
                     sub = parse_jwt_sub(cli_jwt)
                     device_mid = generate_device_mid(sub or cli_jwt)
-                    
+
                     target["jwt"] = cli_jwt
                     target["cli_jwt"] = cli_jwt
                     target["sub"] = sub
@@ -662,12 +785,13 @@ async def oauth_cli_start_api(task_id: str):
                     target["status"] = "SUCCESS"
                     target["message"] = f"🎉 官方 OAuth 授权成功！已绑定账号 {user_info.get('email', target['email'])}"
                     save_tasks(tasks)
+                    archive_credentials()
                     await broadcast("TASK_UPDATED", target)
                     sync_log_callback(task_id, f"🎉 账号 {target['email']} 已成功提取官方 Coding Plan 专用 JWT！", "success")
                     break
             except Exception:
                 pass
-                
+
     asyncio.create_task(poll_flow())
     return {
         "success": True,
@@ -687,7 +811,7 @@ async def export_tokens_txt():
             try:
                 # 严格过滤游客 guest token
                 p = jwt.split(".")[1]
-                p += "=" * (4 - len(p) % 4)
+                p += "=" * ((4 - len(p) % 4) % 4)
                 data = json.loads(base64.urlsafe_b64decode(p))
                 if "guest-" in str(data.get("email", "")):
                     continue

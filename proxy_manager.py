@@ -1,9 +1,18 @@
 import time
 import random
+import re
 import requests
 import asyncio
 from typing import Dict, Any, List, Optional, Callable
-from urllib.parse import urlparse, quote
+from urllib.parse import quote
+
+class ProxyFailure(Exception):
+    """
+    代理链路本身的故障（CDN 加载失败 / WAF 405 / 隧道不通 / 验证码服务不可达）。
+    用异常类型显式标记，而不是让上层去猜中文错误文案里的关键字：
+    旧实现靠 is_proxy_error() 做子串匹配，而 register_worker 抛的中文提示
+    一个关键字都不含，导致「自动换代理 / 405 熔断」从未真正触发过。
+    """
 
 # In-memory tracking of disabled proxies: { raw_str: { "display": "...", "error": "...", "time": "...", "failures": 1 } }
 _DISABLED_PROXIES: Dict[str, Dict[str, Any]] = {}
@@ -22,7 +31,6 @@ def is_proxy_error(err_str: str) -> bool:
         "proxy connection failed",
         "proxyerror",
         "sockserror",
-        "socks5",
         "connection refused",
         "host is unreachable",
         "proxy closed connection",
@@ -34,6 +42,50 @@ def is_proxy_error(err_str: str) -> bool:
         "bad gateway"
     ]
     return any(k in err_lower for k in proxy_keywords)
+
+_HOST_RE = re.compile(
+    r"^(?:"
+    r"\d{1,3}(?:\.\d{1,3}){3}"                                            # IPv4
+    r"|\[[0-9a-fA-F:]+\]"                                                 # 带方括号的 IPv6
+    r"|localhost"
+    r"|(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}"  # 域名
+    r")$"
+)
+
+def _looks_like_host(value: str) -> bool:
+    return bool(value) and bool(_HOST_RE.match(value))
+
+def _valid_port(value: str) -> bool:
+    return bool(value) and value.isdigit() and 0 < int(value) <= 65535
+
+def _split_host_port(value: str) -> tuple:
+    """把 'host:port' / '[::1]:port' 拆开，失败返回 (None, None)。"""
+    value = value.strip()
+    if not value:
+        return None, None
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            return None, None
+        host = value[1:end]
+        tail = value[end + 1:]
+        if not tail:
+            return host, None
+        if not tail.startswith(":") or not _valid_port(tail[1:]):
+            return None, None
+        return host, int(tail[1:])
+    if value.count(":") > 1:
+        # 裸 IPv6 不带端口，无法确定端口
+        return None, None
+    if ":" not in value:
+        return value, None
+    host, _, port_s = value.rpartition(":")
+    if not _valid_port(port_s):
+        return None, None
+    return host, int(port_s)
+
+def _fmt_host(host: str) -> str:
+    return f"[{host}]" if ":" in host else host
 
 def parse_proxy(raw: str) -> Optional[Dict[str, Any]]:
     """
@@ -57,6 +109,9 @@ def parse_proxy(raw: str) -> Optional[Dict[str, Any]]:
     if "://" in rest:
         scheme, rest = rest.split("://", 1)
         scheme = scheme.lower()
+    rest = rest.strip()
+    if not rest:
+        return None
         
     is_socks = "socks" in scheme
     pw_scheme = "socks5" if is_socks else ("https" if scheme == "https" else "http")
@@ -66,37 +121,42 @@ def parse_proxy(raw: str) -> Optional[Dict[str, Any]]:
     username = None
     password = None
     
-    parts = rest.split(":")
-    
-    # 1. Check if rest starts with host:port (where parts[1] is a numeric port like 8080)
-    # e.g. host:port, host:port:user:password
-    if len(parts) >= 2 and parts[1].isdigit():
-        hostname = parts[0]
-        port = int(parts[1])
-        if len(parts) >= 4:
-            username = parts[2]
-            password = ":".join(parts[3:])
-    # 2. Check user:pass:host:port (where parts[3] is a numeric port)
-    elif len(parts) == 4 and parts[3].isdigit():
-        username = parts[0]
-        password = parts[1]
-        hostname = parts[2]
-        port = int(parts[3])
-    # 3. Standard URL / user:pass@host:port
+    if "@" in rest:
+        # user:password@host:port
+        cred, _, hostpart = rest.rpartition("@")
+        if ":" in cred:
+            username, _, password = cred.partition(":")
+        else:
+            username = cred
+        hostname, port = _split_host_port(hostpart)
+    elif rest.startswith("["):
+        # [::1]:8080 之类的 IPv6 字面量
+        hostname, port = _split_host_port(rest)
     else:
-        try:
-            parsed = urlparse(f"{scheme}://{rest}")
-            hostname = parsed.hostname
-            port = parsed.port
-            username = parsed.username
-            password = parsed.password
-        except Exception:
-            return None
+        parts = rest.split(":")
+        if len(parts) == 2:
+            hostname, port = _split_host_port(rest)
+        elif len(parts) == 3:
+            # host:port:user（无密码）
+            if _looks_like_host(parts[0]) and _valid_port(parts[1]):
+                hostname, port, username = parts[0], int(parts[1]), parts[2]
+        elif len(parts) >= 4:
+            # 4 段格式本身有歧义：host:port:user:pass 还是 user:pass:host:port？
+            # 旧实现只看 parts[1].isdigit()，于是 'admin:1234:1.2.3.4:8080'
+            # 被解析成 host='admin', port=1234, user='1.2.3.4', pass='8080'。
+            # 改为判断哪一侧真的像主机名，再用端口范围二次校验。
+            if _looks_like_host(parts[0]) and _valid_port(parts[1]):
+                hostname, port = parts[0], int(parts[1])
+                username = parts[2]
+                password = ":".join(parts[3:])
+            elif _looks_like_host(parts[2]) and _valid_port(parts[3]):
+                username, password = parts[0], parts[1]
+                hostname, port = parts[2], int(parts[3])
             
     if not hostname or not port:
         return None
         
-    pw_cfg = {"server": f"{pw_scheme}://{hostname}:{port}"}
+    pw_cfg = {"server": f"{pw_scheme}://{_fmt_host(hostname)}:{port}"}
     if username is not None:
         pw_cfg["username"] = username
     if password is not None:
@@ -104,21 +164,48 @@ def parse_proxy(raw: str) -> Optional[Dict[str, Any]]:
         
     # Construct requests_proxy URL with URL encoding for auth credentials
     if username is not None and password is not None:
-        req_auth = f"{quote(username)}:{quote(password)}@"
+        req_auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
     elif username is not None:
-        req_auth = f"{quote(username)}@"
+        req_auth = f"{quote(username, safe='')}@"
     else:
         req_auth = ""
         
-    requests_proxy = f"{scheme}://{req_auth}{hostname}:{port}"
+    requests_proxy = f"{scheme}://{req_auth}{_fmt_host(hostname)}:{port}"
     
     return {
         "raw": raw,
-        "display": f"{scheme.upper()}://{hostname}:{port}",
+        "display": f"{scheme.upper()}://{_fmt_host(hostname)}:{port}",
         "scheme": scheme.upper(),
         "playwright_cfg": pw_cfg,
         "requests_proxy": requests_proxy
     }
+
+def playwright_cfg_to_requests_proxy(pw_cfg: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    把 Playwright 的 proxy 配置转成 requests 可用的代理 URL。
+    zcode_token 里的 OAuth HTTP 请求必须走同一个出口，否则会从真实 IP 发出去。
+    """
+    if not pw_cfg:
+        return None
+    server = (pw_cfg.get("server") or "").strip()
+    if not server:
+        return None
+    user = pw_cfg.get("username")
+    pwd = pw_cfg.get("password")
+    if user is not None and pwd is not None:
+        auth = f"{quote(str(user), safe='')}:{quote(str(pwd), safe='')}@"
+    elif user is not None:
+        auth = f"{quote(str(user), safe='')}@"
+    else:
+        auth = ""
+    if "://" in server:
+        sch, _, hostport = server.partition("://")
+    else:
+        sch, hostport = "http", server
+    sch = sch.lower()
+    if sch.startswith("socks"):
+        sch = "socks5"
+    return f"{sch}://{auth}{hostport}"
 
 def get_proxy_list(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Extracts all configured proxies from config."""
@@ -242,28 +329,44 @@ def test_proxy_sync(proxy_str: str) -> Dict[str, Any]:
                 "latency_ms": latency,
                 "message": f"连通正常 (出口IP: {ip}, 延迟: {latency}ms)"
             }
-        else:
-            report_proxy_failure(proxy_str, f"HTTP状态码: {resp.status_code}")
-            return {
-                "proxy": parsed["display"],
-                "raw": proxy_str,
-                "scheme": parsed["scheme"],
-                "success": False,
-                "message": f"HTTP状态码: {resp.status_code}"
-            }
-    except Exception as e:
-        report_proxy_failure(proxy_str, str(e))
+        # 407 = 代理要求认证，属于代理本身的问题；其它非 200 多为探测站限流，不该熔断
+        if resp.status_code == 407:
+            report_proxy_failure(proxy_str, f"HTTP状态码: {resp.status_code} (需要代理认证)")
         return {
             "proxy": parsed["display"],
             "raw": proxy_str,
             "scheme": parsed["scheme"],
             "success": False,
-            "message": f"连接失败: {str(e)}"
+            "message": f"HTTP状态码: {resp.status_code}"
+        }
+    except Exception as e:
+        err = str(e)
+        # 只有确认是代理链路故障才熔断；探测目标站(ipify)不可达时拉黑代理是误伤
+        if is_proxy_error(err):
+            report_proxy_failure(proxy_str, err)
+            message = f"连接失败: {err}"
+        else:
+            message = f"探测目标不可达，未熔断该代理: {err}"
+        return {
+            "proxy": parsed["display"],
+            "raw": proxy_str,
+            "scheme": parsed["scheme"],
+            "success": False,
+            "message": message
         }
 
-async def test_proxies_async(proxy_strings: List[str]) -> List[Dict[str, Any]]:
-    """Concurrently tests a list of proxies."""
-    tasks = [asyncio.to_thread(test_proxy_sync, p) for p in proxy_strings if p.strip() and not p.strip().startswith("#")]
-    if not tasks:
+async def test_proxies_async(proxy_strings: List[str], limit: int = 8) -> List[Dict[str, Any]]:
+    """
+    Concurrently tests a list of proxies.
+    并发数有上限：旧实现直接 gather 整池，500 条代理会一次性开 500 个 OS 线程。
+    """
+    targets = [p for p in proxy_strings if p.strip() and not p.strip().startswith("#")]
+    if not targets:
         return []
-    return await asyncio.gather(*tasks)
+    sem = asyncio.Semaphore(max(1, min(limit, len(targets))))
+
+    async def run_one(p: str) -> Dict[str, Any]:
+        async with sem:
+            return await asyncio.to_thread(test_proxy_sync, p)
+
+    return await asyncio.gather(*(run_one(p) for p in targets))

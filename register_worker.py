@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from typing import Dict, Any, Callable, Optional
 from playwright.async_api import async_playwright, Page, BrowserContext, Browser
@@ -7,9 +8,14 @@ from proxy_manager import (
     report_proxy_failure,
     report_proxy_success,
     is_proxy_error,
-    get_proxy_list
+    get_proxy_list,
+    ProxyFailure
 )
 
+# CDN 静态资源本地缓存：{ url: (status, content_type, body) }
+_ASSET_CACHE: Dict[str, tuple] = {}
+# 只拦截这两个 CDN 域名（旧实现对 "**/*" 全量拦截，每个请求都多一次路由往返）
+_CDN_ROUTE_RE = re.compile(r"^https?://[^/]*(?:chatglm\.cn|alicdn\.com)(?:/|$)")
 class RegisterWorker:
     def __init__(self, config: Dict[str, Any], email_service: Any, log_callback: Optional[Callable[[str, str], None]] = None, cdp_callback: Optional[Callable[[str, str, Any], None]] = None, captcha_lock: Optional[asyncio.Lock] = None):
         self.config = config
@@ -17,7 +23,6 @@ class RegisterWorker:
         self.log_callback = log_callback
         self.cdp_callback = cdp_callback
         self.captcha_lock = captcha_lock or asyncio.Lock()
-        self._is_paused = False
         self._current_page: Optional[Page] = None
         self._current_browser: Optional[Browser] = None
 
@@ -34,32 +39,52 @@ class RegisterWorker:
         Intercepts static CDN assets (e.g. z-cdn.chatglm.cn, o.alicdn.com) that may be blocked
         or throttled by overseas proxy firewalls, ensuring frontend JS/CSS bundles load reliably
         while keeping 100% of API/auth/CAPTCHA dynamic verification traffic strictly on the proxy.
+
+        只对这两个 CDN 域名挂路由：旧实现 page.route("**/*") 拦下全部请求再 continue_()，
+        等于给页面每个请求都平白多叠一次 Playwright 路由往返。
         """
         import urllib.request
+
         async def handle_cdn(route):
             url = route.request.url
-            if "chatglm.cn" in url or "alicdn.com" in url:
+            cached = _ASSET_CACHE.get(url)
+            if cached is None:
                 try:
                     def fetch_asset():
                         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                         with urllib.request.urlopen(req, timeout=10) as r:
                             return r.status, r.headers.get("content-type", "application/javascript"), r.read()
-                    status, ctype, body = await asyncio.to_thread(fetch_asset)
-                    await route.fulfill(status=status, content_type=ctype, body=body)
-                    return
+
+                    cached = await asyncio.to_thread(fetch_asset)
+                    if len(_ASSET_CACHE) < 512:
+                        _ASSET_CACHE[url] = cached
+                except Exception:
+                    cached = None
+
+            if cached is None:
+                await route.continue_()
+                return
+            status, ctype, body = cached
+            try:
+                await route.fulfill(status=status, content_type=ctype, body=body)
+            except Exception:
+                try:
+                    await route.continue_()
                 except Exception:
                     pass
-            await route.continue_()
-            
-        await page.route("**/*", handle_cdn)
+
+        await page.route(_CDN_ROUTE_RE, handle_cdn)
 
     async def execute_task(self, task: Dict[str, Any], on_status_change: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         """
         Executes registration for a single account with automatic proxy failover retry.
         """
-        from proxy_manager import get_proxy_list
+        from proxy_manager import get_proxy_list, get_disabled_proxies
         all_proxies = get_proxy_list(self.config) if self.config.get("proxy_enabled", False) else []
-        max_attempts = max(1, min(len(all_proxies), 8)) if all_proxies else 1
+        # 只把当前仍健康的节点计入重试预算，已熔断的节点不该占用尝试次数
+        disabled = get_disabled_proxies()
+        healthy_count = len([p for p in all_proxies if p["raw"] not in disabled])
+        max_attempts = max(1, min(healthy_count, 8)) if all_proxies else 1
 
         for attempt in range(max_attempts):
             res = await self._run_register_attempt(task, attempt, max_attempts, on_status_change)
@@ -91,6 +116,8 @@ class RegisterWorker:
 
         proxy_info = None
         browser = None
+        # 标记"注册请求是否已成功提交"，用于禁止提交后的代理重试
+        signup_submitted = False
         async with async_playwright() as p:
             try:
                 launch_options = {
@@ -261,7 +288,7 @@ class RegisterWorker:
 
                 if not has_captcha:
                     if proxy_info:
-                        raise Exception("当前代理无法加载人机滑块资源 (Alibaba CDN/Gateway 连接超时/阻断)，触发自动换代理")
+                        raise ProxyFailure("当前代理无法加载人机滑块资源 (Alibaba CDN/Gateway 连接超时/阻断)，触发自动换代理")
                     else:
                         raise Exception("未检测到人机滑块验证模块，请检查网络连接")
 
@@ -274,7 +301,7 @@ class RegisterWorker:
                     update_status("WAITING_CAPTCHA", "👉 请在 /verify 页面滑动完成拼图！")
 
                     if captcha_cdn_error[0]:
-                        raise Exception("当前代理无法连接阿里云人机验证服务端 (Aliyun Captcha Timeout/INIT_FAIL)，触发自动换代理")
+                        raise ProxyFailure("当前代理无法连接阿里云人机验证服务端 (Aliyun Captcha Timeout/INIT_FAIL)，触发自动换代理")
 
                     # 点击验证码按钮弹出滑块拼图浮窗
                     try:
@@ -333,10 +360,14 @@ class RegisterWorker:
                     try:
                         while not captcha_solved.is_set():
                             if captcha_cdn_error[0]:
-                                raise Exception("阿里云验证服务连接超时或网络异常 (INIT_FAIL)，当前代理网络质量不佳，触发自动换代理")
+                                raise ProxyFailure("阿里云验证服务连接超时或网络异常 (INIT_FAIL)，当前代理网络质量不佳，触发自动换代理")
 
                             if time.time() - start_wait > captcha_timeout:
                                 raise TimeoutError("等待人工滑块验证超时（超过配置的时间上限）")
+
+                            # captcha_fail_count 之前只累加从不使用，这里让它真正生效
+                            if captcha_fail_count[0] >= 8:
+                                raise TimeoutError("连续 8 次滑动验证均未通过，已放弃当前账号")
 
                             # 检查页面是否已通过其他方式确认成功
                             is_verified = await page.evaluate("""() => {
@@ -448,7 +479,7 @@ class RegisterWorker:
                         err_msg = error_toast or (f"接口返回 HTTP {signup_response['status']}: {signup_response['data']}" if signup_response['status'] else "提交注册未成功跳转（可能滑块未通过或网络延迟），未收到服务器跳转信号")
                     
                     if proxy_info:
-                        raise Exception(f"当前代理节点提交注册被拦截 ({err_msg})，触发自动切换新节点")
+                        raise ProxyFailure(f"当前代理节点提交注册被拦截 ({err_msg})，触发自动切换新节点")
                     else:
                         self.log(task_id, f"❌ {err_msg}", "error")
                         update_status("FAILED", f"提交失败: {err_msg}")
@@ -456,6 +487,7 @@ class RegisterWorker:
                         return task
 
                 self.log(task_id, "成功进入邮箱验证页面！", "success")
+                signup_submitted = True
 
                 # 8. 邮箱验证环节
                 signup_submit_time = time.time()
@@ -513,7 +545,7 @@ class RegisterWorker:
                         if tok_candidate:
                             try:
                                 p_b64 = tok_candidate.split('.')[1]
-                                p_b64 += '=' * (4 - len(p_b64) % 4)
+                                p_b64 += '=' * ((4 - len(p_b64) % 4) % 4)
                                 payload = json.loads(base64.urlsafe_b64decode(p_b64))
                                 tok_email = str(payload.get("email", "")).lower()
                                 if tok_email and not tok_email.startswith("guest-"):
@@ -568,7 +600,6 @@ class RegisterWorker:
 
                 await browser.close()
                 return task
-
             except Exception as e:
                 err_str = str(e)
                 self.log(task_id, f"⚠️ 捕获到执行异常: {err_str}", "warning")
@@ -578,17 +609,26 @@ class RegisterWorker:
                     except Exception:
                         pass
 
-                from proxy_manager import is_proxy_error, report_proxy_failure, get_next_task_proxy
-                if proxy_info and is_proxy_error(err_str):
-                    report_proxy_failure(proxy_info["raw"], err_str)
-                    self.log(task_id, f"🚫 代理 [{proxy_info['display']}] 连接失效，已触发自动熔断并移出可用池！", "error")
+                # 代理故障改用异常类型显式判定：上面四处 "触发自动换代理" 现在抛 ProxyFailure，
+                # 不再依赖 is_proxy_error() 去匹配中文文案（旧实现永远匹配不上，自动换代理从未生效）。
+                proxy_failed = isinstance(e, ProxyFailure) or is_proxy_error(err_str)
 
-                    next_proxy = get_next_task_proxy(self.config)
-                    if attempt < max_attempts - 1 and next_proxy:
-                        self.log(task_id, f"🔄 检测到代理异常，正在自动无缝切换到新节点重试当前任务 (尝试 {attempt + 2}/{max_attempts})...", "warning")
-                        update_status("RUNNING", f"代理连接失败，正在自动切换下一节点重试 ({attempt + 1})...")
-                        await asyncio.sleep(1)
-                        return {"_proxy_retry": True}
+                if proxy_failed:
+                    if proxy_info:
+                        report_proxy_failure(proxy_info["raw"], err_str)
+                        self.log(task_id, f"🚫 代理 [{proxy_info['display']}] 连接失效，已触发自动熔断并移出可用池！", "error")
+
+                    if signup_submitted:
+                        # 账号已经注册成功，重跑只会撞"邮箱已存在"，
+                        # 反而把一个已经建好的账号判成失败，所以这里不再重试。
+                        self.log(task_id, "账号已提交注册成功，不再重试以免同一邮箱重复注册；请稍后点「重新提取 JWT」", "warning")
+                    else:
+                        next_proxy = get_next_task_proxy(self.config)
+                        if attempt < max_attempts - 1 and next_proxy:
+                            self.log(task_id, f"🔄 检测到代理异常，正在自动无缝切换到新节点重试当前任务 (尝试 {attempt + 2}/{max_attempts})...", "warning")
+                            update_status("RUNNING", f"代理连接失败，正在自动切换下一节点重试 ({attempt + 1})...")
+                            await asyncio.sleep(1)
+                            return {"_proxy_retry": True}
 
                 self.log(task_id, f"执行异常: {err_str}", "error")
                 update_status("FAILED", f"错误: {err_str}")
@@ -625,7 +665,7 @@ class RegisterWorker:
                 await page.wait_for_timeout(1000)
                 
                 # Click Continue with Email
-                await page.locator("button:has-text('Email')").click()
+                await page.locator("button:has-text('Email')").first.click()
                 await page.wait_for_timeout(1000)
                 
                 # Fill sign in
@@ -707,7 +747,10 @@ class RegisterWorker:
                 self.log(task_id, "登录成功，正在提取 Web JWT 与 ZCode CLI 专属凭据...", "info")
                 web_jwt = await page.evaluate("() => localStorage.getItem('token') || localStorage.token || ''")
                 from zcode_token import fetch_zcode_cli_token, parse_jwt_sub, generate_device_mid
-                zcode_data = await fetch_zcode_cli_token(page)
+                # OAuth 的 HTTP 请求也必须走同一个代理出口，
+                # 否则浏览器在代理里、取票请求却从真实 IP 打官方接口
+                req_proxy = proxy_info.get("requests_proxy") if proxy_info else None
+                zcode_data = await fetch_zcode_cli_token(page, requests_proxy=req_proxy)
                 
                 await browser.close()
                 res = {"success": True, "web_jwt": web_jwt}
@@ -730,7 +773,8 @@ class RegisterWorker:
             url = f"https://chat.z.ai/auth/verify_email?token={url}"
             
         async with async_playwright() as p:
-            launch_options = {"headless": True}
+            # 旧实现硬编码 headless=True，无视全局配置
+            launch_options = {"headless": bool(self.config.get("headless", True))}
             from proxy_manager import get_next_task_proxy
             proxy_info = get_next_task_proxy(self.config)
             if proxy_info:
@@ -738,7 +782,8 @@ class RegisterWorker:
                 
             browser = await p.chromium.launch(**launch_options)
             try:
-                page = await browser.new_page()
+                context = await browser.new_context()
+                page = await context.new_page()
                 await self._setup_page_routes(page)
                 await page.goto(url, wait_until="domcontentloaded", timeout=25000)
                 try:
